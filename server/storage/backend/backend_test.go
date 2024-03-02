@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -297,6 +298,53 @@ func TestConcurrentReadTx(t *testing.T) {
 	if !reflect.DeepEqual(wKey, k) || !reflect.DeepEqual(wVal, v) {
 		t.Errorf("want k=%+v, v=%+v; got k=%+v, v=%+v", wKey, wVal, k, v)
 	}
+}
+
+// TestConcurrentReadTx ensures that current read transaction can see all prior writes stored in read buffer
+func TestConcurrentReadTxCopySameVersionReadBufMoreThanOnce(t *testing.T) {
+	b, _ := betesting.NewTmpBackend(t, time.Hour, 10000)
+	defer betesting.Close(t, b)
+
+	wtx1 := b.BatchTx()
+	wtx1.Lock()
+	wtx1.UnsafeCreateBucket(schema.Key)
+	wtx1.UnsafePut(schema.Key, []byte("abc"), []byte("ABC"))
+	wtx1.UnsafePut(schema.Key, []byte("overwrite"), []byte("1"))
+	wtx1.Unlock()
+
+	// init concurrent readtx version to 1
+	rtx := b.ConcurrentReadTx()
+	rtx.RLock()
+	// do nothing
+	rtx.RUnlock()
+
+	// update write tx buffer
+	wtx2 := b.BatchTx()
+	wtx2.Lock()
+	wtx2.UnsafePut(schema.Key, []byte("def"), []byte("DEF"))
+	wtx2.UnsafePut(schema.Key, []byte("overwrite"), []byte("2"))
+	wtx2.Unlock()
+
+	count := 50
+	var wg sync.WaitGroup
+	wg.Add(count)
+	// now the readTx.buf should be stale
+	for i := 0; i < count; i++ {
+		go func() {
+			defer wg.Done()
+
+			rtx = b.ConcurrentReadTx()
+			rtx.RLock() // no-op
+			k, v := rtx.UnsafeRange(schema.Key, []byte("abc"), []byte("\xff"), 0)
+			rtx.RUnlock()
+			wKey := [][]byte{[]byte("abc"), []byte("def"), []byte("overwrite")}
+			wVal := [][]byte{[]byte("ABC"), []byte("DEF"), []byte("2")}
+			if !reflect.DeepEqual(wKey, k) || !reflect.DeepEqual(wVal, v) {
+				t.Errorf("want k=%+v, v=%+v; got k=%+v, v=%+v", wKey, wVal, k, v)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // TestBackendWritebackForEach checks that partially written / buffered

@@ -51,6 +51,7 @@ type Backend interface {
 	BatchTx() BatchTx
 	// ConcurrentReadTx returns a non-blocking read transaction.
 	ConcurrentReadTx() ReadTx
+	ConcurrentReadTxNew() ReadTx
 
 	Snapshot() Snapshot
 	Hash(ignores func(bucketName, keyName []byte) bool) (uint32, error)
@@ -83,9 +84,10 @@ type Snapshot interface {
 }
 
 type txReadBufferCache struct {
-	mu         sync.Mutex
-	buf        *txReadBuffer
-	bufVersion uint64
+	mu          sync.Mutex
+	buf         *txReadBuffer
+	bufVersion  uint64
+	copiedTimes uint64
 }
 
 type backend struct {
@@ -290,6 +292,10 @@ func (b *backend) ConcurrentReadTx() ReadTx {
 		b.txReadBufferCache.mu.Unlock()
 		curBuf := b.readTx.buf.unsafeCopy()
 		b.txReadBufferCache.mu.Lock()
+		b.txReadBufferCache.copiedTimes++
+		if b.txReadBufferCache.copiedTimes > 1 {
+			b.lg.Info("same buffer version copied multiple times", zap.Uint64("times", b.txReadBufferCache.copiedTimes), zap.Uint64("version", b.txReadBufferCache.bufVersion))
+		}
 		buf = &curBuf
 	default:
 		// neither empty nor stale cache, just use the current buffer
@@ -307,6 +313,64 @@ func (b *backend) ConcurrentReadTx() ReadTx {
 		// continue if the cache is never set or no one has modified the cache
 		b.txReadBufferCache.buf = buf
 		b.txReadBufferCache.bufVersion = curBufVer
+	}
+
+	b.txReadBufferCache.mu.Unlock()
+
+	// concurrentReadTx is not supposed to write to its txReadBuffer
+	return &concurrentReadTx{
+		baseReadTx: baseReadTx{
+			buf:     *buf,
+			txMu:    b.readTx.txMu,
+			tx:      b.readTx.tx,
+			buckets: b.readTx.buckets,
+			txWg:    b.readTx.txWg,
+		},
+	}
+}
+
+// ConcurrentReadTx creates and returns a new ReadTx, which:
+// A) creates and keeps a copy of backend.readTx.txReadBuffer,
+// B) references the boltdb read Tx (and its bucket cache) of current batch interval.
+func (b *backend) ConcurrentReadTxNew() ReadTx {
+	b.readTx.RLock()
+	defer b.readTx.RUnlock()
+	// prevent boltdb read Tx from been rolled back until store read Tx is done. Needs to be called when holding readTx.RLock().
+	b.readTx.txWg.Add(1)
+
+	// TODO: might want to copy the read buffer lazily - create copy when A) end of a write transaction B) end of a batch interval.
+
+	// inspect/update cache recency iff there's no ongoing update to the cache
+	// this falls through if there's no cache update
+
+	// by this line, "ConcurrentReadTx" code path is already protected against concurrent "writeback" operations
+	// which requires write lock to update "readTx.baseReadTx.buf".
+	// Which means setting "buf *txReadBuffer" with "readTx.buf.unsafeCopy()" is guaranteed to be up-to-date,
+	// whereas "txReadBufferCache.buf" may be stale from concurrent "writeback" operations.
+	// We only update "txReadBufferCache.buf" if we know "buf *txReadBuffer" is up-to-date.
+	// The update to "txReadBufferCache.buf" will benefit the following "ConcurrentReadTx" creation
+	// by avoiding copying "readTx.baseReadTx.buf".
+	b.txReadBufferCache.mu.Lock()
+
+	curCache := b.txReadBufferCache.buf
+	curCacheVer := b.txReadBufferCache.bufVersion
+	curBufVer := b.readTx.buf.bufVersion
+
+	isEmptyCache := curCache == nil
+	isStaleCache := curCacheVer != curBufVer
+
+	var buf *txReadBuffer
+	switch {
+	case isEmptyCache || isStaleCache:
+		// perform safe copy of buffer while holding "b.txReadBufferCache.mu.Lock"
+		// this is only supposed to run once so there won't be much overhead
+		curBuf := b.readTx.buf.unsafeCopy()
+		b.txReadBufferCache.buf = &curBuf
+		b.txReadBufferCache.bufVersion = curBufVer
+		buf = &curBuf
+	default:
+		// neither empty nor stale cache, just use the current buffer
+		buf = curCache
 	}
 
 	b.txReadBufferCache.mu.Unlock()
